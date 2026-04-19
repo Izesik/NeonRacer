@@ -128,6 +128,33 @@
     transform: skewX(-10deg) scale(1.05);
 }
 
+.menu-btn.focused {
+    border-color: #00ffcc;
+    color: #00ffcc;
+    box-shadow: 0 0 18px #00ffcc;
+    transform: scale(1.05);
+}
+
+#start-race-btn.focused {
+    background: #ccfffa;
+    transform: scale(1.1);
+    box-shadow: 0 0 35px #00ffcc;
+}
+
+#pause-overlay {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0, 0, 0, 0.82);
+    z-index: 150;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    color: white;
+}
+#pause-overlay h2 {
+    font-size: 3rem; color: #00ffcc;
+    text-shadow: 0 0 20px #00ffcc, 4px 4px 0px #ff0055;
+    margin-bottom: 40px; font-style: italic; letter-spacing: 4px;
+}
+#pause-overlay .menu-btn { min-width: 260px; margin-top: 12px; font-size: 1.1rem; }
+
     </style>
 </head>
 <body>
@@ -179,6 +206,12 @@
         <div class="result-row"><span>Lap 5:</span> <span id="res-lap5">--:--</span></div>
         <div class="total-time" id="res-total">00:00.00</div>
         <button id="return-menu-btn" class="menu-btn" style="border-color:#00ffcc; color:#00ffcc">RETURN TO MENU</button>
+    </div>
+
+    <div id="pause-overlay" class="hidden">
+        <h2>PAUSED</h2>
+        <button id="pause-restart-btn" class="menu-btn">RESTART RACE</button>
+        <button id="pause-exit-btn" class="menu-btn">EXIT TO MENU</button>
     </div>
 
     <div id="ui-container" class="hidden">

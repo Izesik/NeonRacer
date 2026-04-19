@@ -1177,7 +1177,12 @@ class CarControls {
     }
 
     pollGamepad() {
-        if (this.gamepadIndex === null) return;
+        if (this.gamepadIndex === null) {
+            const pads = Array.from(navigator.getGamepads());
+            const found = pads.find(p => p && p.connected);
+            if (found) this.gamepadIndex = found.index;
+            else return;
+        }
         const gp = navigator.getGamepads()[this.gamepadIndex];
         if (!gp) return;
 
@@ -1755,6 +1760,181 @@ if (btnRestart) {
 }
 
 
+// Wire pause overlay buttons to existing handlers
+document.getElementById('pause-restart-btn')?.addEventListener('click', () => {
+    document.getElementById('pause-overlay').classList.add('hidden');
+    btnRestartRace?.click();
+});
+document.getElementById('pause-exit-btn')?.addEventListener('click', () => {
+    document.getElementById('pause-overlay').classList.add('hidden');
+    returnToMainMenu();
+});
+
+// --- GAMEPAD MENU NAVIGATOR ---
+const MenuNavigator = (() => {
+    const SECTIONS = ['mode-select', 'engine-select', 'car-select', 'start'];
+    let sectionIdx = 0;
+    let btnIdx = 0;
+    let pauseFocusIdx = 0;
+    let prev = {};
+
+    function getActiveGamepad() {
+        for (const pad of navigator.getGamepads()) {
+            if (pad && pad.connected) return pad;
+        }
+        return null;
+    }
+
+    function getSectionBtns(sectionId) {
+        if (sectionId === 'start') {
+            const el = document.getElementById('start-race-btn');
+            return el ? [el] : [];
+        }
+        const c = document.getElementById(sectionId);
+        return c ? Array.from(c.getElementsByClassName('menu-btn')) : [];
+    }
+
+    function clearFocus() {
+        SECTIONS.forEach(s => getSectionBtns(s).forEach(b => b.classList.remove('focused')));
+        document.getElementById('pause-restart-btn')?.classList.remove('focused');
+        document.getElementById('pause-exit-btn')?.classList.remove('focused');
+    }
+
+    function applyMenuFocus() {
+        clearFocus();
+        getSectionBtns(SECTIONS[sectionIdx])[btnIdx]?.classList.add('focused');
+    }
+
+    function applyPauseFocus() {
+        clearFocus();
+        const id = pauseFocusIdx === 0 ? 'pause-restart-btn' : 'pause-exit-btn';
+        document.getElementById(id)?.classList.add('focused');
+    }
+
+    // Returns true only on the frame a button transitions to pressed
+    function justPressed(gp, idx) {
+        const cur = gp.buttons[idx]?.pressed || false;
+        return cur && !prev[`b${idx}`];
+    }
+
+    // Returns true only on the frame an axis crosses the threshold
+    function axisMoved(gp, axis, dir) {
+        const THRESH = 0.5;
+        const cur = dir > 0 ? gp.axes[axis] > THRESH : gp.axes[axis] < -THRESH;
+        return cur && !prev[`a${axis}d${dir}`];
+    }
+
+    function savePrev(gp) {
+        gp.buttons.forEach((b, i) => prev[`b${i}`] = b.pressed);
+        gp.axes.forEach((v, i) => {
+            prev[`a${i}d1`]  = v >  0.5;
+            prev[`a${i}d-1`] = v < -0.5;
+        });
+    }
+
+    function isHidden(id) {
+        const el = document.getElementById(id);
+        if (!el) return true;
+        return el.classList.contains('hidden') || el.style.display === 'none';
+    }
+
+    function currentScreen() {
+        if (!isHidden('intro-screen'))  return 'intro';
+        if (!isHidden('main-menu'))     return 'menu';
+        if (!isHidden('pause-overlay')) return 'pause';
+        if (!isHidden('results-screen')) return 'results';
+        return 'ingame';
+    }
+
+    function showPause() {
+        if (!carController) return;
+        carController.canDrive = false;
+        carController.keys = { forward: false, backward: false, left: false, right: false, space: false };
+        document.getElementById('pause-overlay').classList.remove('hidden');
+        pauseFocusIdx = 0;
+        applyPauseFocus();
+    }
+
+    function hidePause() {
+        document.getElementById('pause-overlay').classList.add('hidden');
+        if (carController) {
+            carController.canDrive = true;
+            carController.keys = { forward: false, backward: false, left: false, right: false, space: false };
+            carController.analogSteering = 0;
+        }
+        clearFocus();
+    }
+
+    function poll() {
+        const gp = getActiveGamepad();
+        if (!gp) { prev = {}; return; }
+
+        const dLeft  = justPressed(gp, 14) || axisMoved(gp, 0, -1);
+        const dRight = justPressed(gp, 15) || axisMoved(gp, 0,  1);
+        const dUp    = justPressed(gp, 12) || axisMoved(gp, 1, -1);
+        const dDown  = justPressed(gp, 13) || axisMoved(gp, 1,  1);
+        const btnA   = justPressed(gp, 0);
+        const btnB   = justPressed(gp, 1);
+        const btnStart = justPressed(gp, 9);
+
+        const screen = currentScreen();
+
+        if (screen === 'intro') {
+            if (btnA || btnStart) document.getElementById('intro-screen')?.click();
+
+        } else if (screen === 'menu') {
+            if (dUp && sectionIdx > 0) {
+                sectionIdx--;
+                btnIdx = Math.min(btnIdx, getSectionBtns(SECTIONS[sectionIdx]).length - 1);
+                applyMenuFocus();
+            }
+            if (dDown && sectionIdx < SECTIONS.length - 1) {
+                sectionIdx++;
+                btnIdx = Math.min(btnIdx, getSectionBtns(SECTIONS[sectionIdx]).length - 1);
+                applyMenuFocus();
+            }
+            const btns = getSectionBtns(SECTIONS[sectionIdx]);
+            if (dLeft  && btnIdx > 0)              { btnIdx--; applyMenuFocus(); }
+            if (dRight && btnIdx < btns.length - 1) { btnIdx++; applyMenuFocus(); }
+            if (btnA) {
+                btns[btnIdx]?.click();
+                applyMenuFocus();
+            }
+            if (btnStart) document.getElementById('start-race-btn')?.click();
+
+        } else if (screen === 'pause') {
+            if (dUp   && pauseFocusIdx > 0) { pauseFocusIdx--; applyPauseFocus(); }
+            if (dDown && pauseFocusIdx < 1) { pauseFocusIdx++; applyPauseFocus(); }
+            if (btnA) {
+                if (pauseFocusIdx === 0) document.getElementById('pause-restart-btn')?.click();
+                else                    document.getElementById('pause-exit-btn')?.click();
+            }
+            if (btnB || btnStart) hidePause();
+
+        } else if (screen === 'results') {
+            if (btnA || btnStart) document.getElementById('return-menu-btn')?.click();
+
+        } else if (screen === 'ingame') {
+            if (btnStart) showPause();
+        }
+
+        savePrev(gp);
+    }
+
+    function init() {
+        sectionIdx = 0;
+        // Align btnIdx to whichever button already has `selected`
+        const btns = getSectionBtns(SECTIONS[sectionIdx]);
+        btnIdx = btns.findIndex(b => b.classList.contains('selected'));
+        if (btnIdx < 0) btnIdx = 0;
+        applyMenuFocus();
+    }
+
+    return { poll, init, hidePause };
+})();
+
+MenuNavigator.init();
+
 // Add a label to it so we don't get confused
 const trackerLabelDiv = document.createElement('div');
 trackerLabelDiv.className = 'label';
@@ -1780,6 +1960,7 @@ function animate() {
 
     requestAnimationFrame(animate);
 
+    MenuNavigator.poll();
 
     const rawDelta = clock.getDelta();
     const deltaTime = Math.min(rawDelta, 0.05);
@@ -1923,6 +2104,9 @@ function returnToMainMenu() {
     // 5. Reset Camera to Default (Optional)
     camera.position.copy(defaultCameraPosition);
     camera.lookAt(defaultCameraTarget);
+
+    MenuNavigator.init();
+    MenuNavigator.hidePause();
 }
 
 // --- INTRO SCREEN LOGIC ---
