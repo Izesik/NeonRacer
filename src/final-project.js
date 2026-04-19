@@ -1988,6 +1988,29 @@ function animate() {
         // 2. Handle Sector Culling (Keep this!)
         if (typeof updateSectorVisibility === 'function') updateSectorVisibility(carWorldPosition);
 
+        // Right stick camera control (chase cam only)
+        if (cameraMode === 0 && carController && carController.gamepadIndex !== null) {
+            const gp = navigator.getGamepads()[carController.gamepadIndex];
+            if (gp) {
+                const DEADZONE = 0.15;
+                const STICK_SPEED = 2.0;
+                const rx = Math.abs(gp.axes[2]) > DEADZONE ? gp.axes[2] : 0;
+                const ry = Math.abs(gp.axes[3]) > DEADZONE ? gp.axes[3] : 0;
+                if (rx !== 0) followSpherical.theta -= rx * STICK_SPEED * deltaTime;
+                if (ry !== 0) followSpherical.phi = THREE.MathUtils.clamp(
+                    followSpherical.phi + ry * STICK_SPEED * deltaTime,
+                    minPolarAngle, maxPolarAngle
+                );
+                // R3 press — reset camera to default behind-car position
+                const r3 = gp.buttons[11]?.pressed || false;
+                if (r3 && !carController._prevR3) {
+                    followSpherical.theta = 0;
+                    followSpherical.phi = THREE.MathUtils.degToRad(60);
+                }
+                carController._prevR3 = r3;
+            }
+        }
+
         if (cameraMode === 0) {
             // --- MODE 0: CHASE CAM (Smooth Elastic Follow) ---
             followSpherical.radius = THREE.MathUtils.clamp(followSpherical.radius, minCameraDistance, maxCameraDistance);
