@@ -128,6 +128,16 @@ let GAME_STATE = {
     isPlaying: false
 };
 
+// Rough directional waypoints — wall-avoidance raycasts do the fine steering
+const DEMO_WAYPOINTS = [
+    new THREE.Vector3(0, 10, -200),    // Straight ahead from start
+    new THREE.Vector3(370, 25, -130),  // Checkpoint 0
+    new THREE.Vector3(80, 47, 615),    // Checkpoint 1
+    new THREE.Vector3(0, 10, 80),      // Finish line
+];
+
+let demoModeActive = false;
+
 // --- ANTI-GHOST SYSTEM ---
 window.gameLoopId = null;
 
@@ -1053,6 +1063,14 @@ class CarControls {
         this.analogSteering = 0;
         this.gamepadIndex = null;
 
+        // AI mode
+        this.aiMode = false;
+        this.aiWaypoints = [];
+        this.aiWaypointIndex = 0;
+        this._aiSteering = 0;
+        this._aiResetCount = 0;
+        this._aiLastResetTime = 0;
+
         window.addEventListener('keydown', (e) => this.onKeyDown(e));
         window.addEventListener('keyup', (e) => this.onKeyUp(e));
         window.addEventListener('gamepadconnected', (e) => { this.gamepadIndex = e.gamepad.index; });
@@ -1106,6 +1124,134 @@ class CarControls {
         if(this.driftSound) this.driftSound.setVolume(0);             
     }
 
+    _updateAIInputs() {
+        const worldPos = new THREE.Vector3();
+        const worldQuat = new THREE.Quaternion();
+        this.model.getWorldPosition(worldPos);
+        this.model.getWorldQuaternion(worldQuat);
+
+        const UP   = new THREE.Vector3(0, 1, 0);
+        const DOWN = new THREE.Vector3(0, -1, 0);
+        const carFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(worldQuat);
+        carFwd.y = 0;
+        if (carFwd.lengthSq() > 0) carFwd.normalize();
+
+        // Left-perpendicular in XZ plane (positive = left, negative = right)
+        const leftPerp = new THREE.Vector3(-carFwd.z, 0, carFwd.x);
+
+        const rayOrigin = worldPos.clone();
+        rayOrigin.y += 1.5;
+
+        // Speed-scaled lookahead: faster = see further ahead
+        const SCAN = THREE.MathUtils.clamp(22 + Math.abs(this.speed) * 0.4, 22, 55);
+
+        // --- WALL DETECTION (7 rays) ---
+        const wallDist = (deg) => {
+            const dir = carFwd.clone().applyAxisAngle(UP, THREE.MathUtils.degToRad(deg));
+            this.wallRaycaster.set(rayOrigin, dir);
+            this.wallRaycaster.far = SCAN;
+            const hits = this.wallRaycaster.intersectObjects(mapColliders);
+            const hit = hits.find(h => h.object.name !== 'SafetyNet');
+            return hit ? hit.distance : SCAN;
+        };
+
+        const fwdDist   = wallDist(0);
+        const leftNear  = wallDist(20);
+        const leftMid   = wallDist(50);
+        const leftWide  = wallDist(80);  // near-perpendicular: catches outer curve walls early
+        const rightNear = wallDist(-20);
+        const rightMid  = wallDist(-50);
+        const rightWide = wallDist(-80);
+
+        const leftSpace  = Math.min(leftNear, leftMid, leftWide);
+        const rightSpace = Math.min(rightNear, rightMid, rightWide);
+
+        // Steer toward the side with more open space
+        let wallAvoid = THREE.MathUtils.clamp((leftSpace - rightSpace) / SCAN * 4, -1, 1);
+
+        // Forward wall ahead: push toward the open side. Use 0.85*SCAN so turns are
+        // detected and acted on long before the wall is directly in front.
+        if (fwdDist < SCAN * 0.85) {
+            const urgency = THREE.MathUtils.clamp(1 - fwdDist / (SCAN * 0.85), 0, 1);
+            const openSide = leftSpace >= rightSpace ? 1.0 : -1.0;
+            wallAvoid = THREE.MathUtils.lerp(wallAvoid, openSide, urgency);
+        }
+
+        // --- CLIFF / ROAD-EDGE DETECTION ---
+        // Cast downward from a point ahead of the car. If no ground is found
+        // within ~10 units below, that side of the track is a cliff or edge.
+        const AHEAD = 14;
+        const hasGround = (fwd, side) => {
+            const p = worldPos.clone()
+                .addScaledVector(carFwd, fwd)
+                .addScaledVector(leftPerp, side);
+            p.y += 4;
+            this.groundRaycaster.set(p, DOWN);
+            this.groundRaycaster.far = 12;
+            const hits = this.groundRaycaster.intersectObjects(mapColliders);
+            return hits.some(h => h.object.name !== 'SafetyNet');
+        };
+
+        const leftGround   = hasGround(AHEAD,  3);
+        const rightGround  = hasGround(AHEAD, -3);
+        const centerGround = hasGround(AHEAD,  0);
+
+        let cliffSteer = 0;
+        let cliffDanger = false;
+        if (!leftGround || !rightGround || !centerGround) {
+            cliffDanger = true;
+            if (!rightGround && leftGround)       cliffSteer =  1.0;  // edge on right → turn left
+            else if (!leftGround && rightGround)  cliffSteer = -1.0;  // edge on left  → turn right
+            else if (!centerGround) {
+                // Road gone straight ahead — favor whichever side still has ground
+                if (leftGround)       cliffSteer = -1.0;
+                else if (rightGround) cliffSteer =  1.0;
+                else                  cliffSteer = (wallAvoid > 0 ? 1.0 : -1.0);
+            }
+        }
+
+        // --- WAYPOINT GUIDANCE (soft directional nudge) ---
+        let waypointSteer = 0;
+        if (this.aiWaypoints && this.aiWaypoints.length > 0) {
+            const target = this.aiWaypoints[this.aiWaypointIndex];
+            const dx = worldPos.x - target.x;
+            const dz = worldPos.z - target.z;
+            if (Math.sqrt(dx * dx + dz * dz) < 50) {
+                this.aiWaypointIndex = (this.aiWaypointIndex + 1) % this.aiWaypoints.length;
+            }
+            const toTarget = new THREE.Vector3(target.x - worldPos.x, 0, target.z - worldPos.z);
+            if (toTarget.lengthSq() > 0) toTarget.normalize();
+            const cross = new THREE.Vector3().crossVectors(carFwd, toTarget);
+            waypointSteer = THREE.MathUtils.clamp(cross.y * 1.5, -1, 1);
+        }
+
+        // --- BLEND ---
+        if (cliffDanger) {
+            // Cliff overrides everything; also scrub speed so the turn is achievable
+            this._aiSteering = cliffSteer;
+            this.keys.forward = Math.abs(this.speed) < 45;
+        } else {
+            const minSpace = Math.min(fwdDist, leftSpace, rightSpace);
+
+            // Walls visible → avoidance takes over with a guaranteed floor of 0.6
+            // so waypoints can never fully override wall steering
+            const rawWeight = THREE.MathUtils.clamp(1 - minSpace / SCAN, 0, 1);
+            const avoidWeight = minSpace < SCAN ? Math.max(rawWeight, 0.6) : 0;
+            this._aiSteering = THREE.MathUtils.lerp(waypointSteer * 0.25, wallAvoid, avoidWeight);
+
+            // Quadratic braking: slow down sharply as the nearest wall closes in
+            const nearWall = Math.min(fwdDist, leftNear, rightNear);
+            const brakeFactor = Math.pow(THREE.MathUtils.clamp(nearWall / (SCAN * 0.65), 0, 1), 2);
+            const targetSpeed = THREE.MathUtils.lerp(35, 85, brakeFactor);
+            this.keys.forward  = Math.abs(this.speed) < targetSpeed;
+            this.keys.backward = this.speed > targetSpeed + 12; // active brake if over limit
+        }
+
+        this.keys.space = false;
+        this.keys.left  = false;
+        this.keys.right = false;
+    }
+
     updateEngineAudio() {
         if (!this.idleSound || !this.accelerationSound || !this.driftSound) return;
         if (this.idleSound.context && this.idleSound.context.state === 'suspended') {
@@ -1144,9 +1290,24 @@ class CarControls {
     }
 
     hardRespawn() {
+        if (this.aiMode) {
+            const now = performance.now() / 1000;
+            if (now - this._aiLastResetTime < 5.0) {
+                this._aiResetCount++;
+            } else {
+                this._aiResetCount = 1;
+            }
+            this._aiLastResetTime = now;
+
+            if (this._aiResetCount >= 3) {
+                this._aiRespawnToWaypoint();
+                return;
+            }
+        }
+
         console.log("Void Respawn");
         this.model.position.copy(this.lastSafePosition);
-        this.model.position.y += 2.0; 
+        this.model.position.y += 2.0;
         const safeEuler = new THREE.Euler().setFromQuaternion(this.lastSafeQuaternion, 'YXZ');
         this.model.rotation.set(0, safeEuler.y, 0);
         this.moveDirection.set(0, 0, -1).applyEuler(this.model.rotation);
@@ -1154,6 +1315,34 @@ class CarControls {
         this.velocity.set(0,0,0);
         this.safePosTimer = 0;
         this.groundMemory = 0;
+    }
+
+    _aiRespawnToWaypoint() {
+        if (!this.aiWaypoints || this.aiWaypoints.length === 0) return;
+
+        // Skip to the next waypoint so we escape the stuck area
+        this.aiWaypointIndex = (this.aiWaypointIndex + 1) % this.aiWaypoints.length;
+        const target   = this.aiWaypoints[this.aiWaypointIndex];
+        const nextIdx  = (this.aiWaypointIndex + 1) % this.aiWaypoints.length;
+        const nextWP   = this.aiWaypoints[nextIdx];
+
+        // Teleport above the waypoint and let suspension handle the landing
+        this.model.position.set(target.x, target.y + 5, target.z);
+
+        // Orient the physics body toward the next waypoint
+        const facingDir = new THREE.Vector3(
+            nextWP.x - target.x, 0, nextWP.z - target.z
+        ).normalize();
+        // atan2(-fx, -fz) gives the Y rotation needed so local -Z aligns with facingDir
+        const yAngle = Math.atan2(-facingDir.x, -facingDir.z);
+        this.model.rotation.set(0, yAngle, 0);
+        this.moveDirection.copy(facingDir);
+
+        this.speed = 0;
+        this.velocity.set(0, 0, 0);
+        this.safePosTimer = 0;
+        this.groundMemory = 0;
+        this._aiResetCount = 0;
     }
 
     onKeyDown(event) {
@@ -1210,7 +1399,7 @@ class CarControls {
     }
 
     spawnSmoke(pos) {
-        const p = this.smokeParticles.find(p => p.life <= 0);
+        const p = this.smokeParticles.find(particle => particle.life <= 0);
         if (p) {
             p.mesh.visible = true;
             p.mesh.position.copy(pos);
@@ -1303,6 +1492,7 @@ class CarControls {
     // --- MAIN LOOP ---
     update(deltaTime) {
         this.pollGamepad();
+        if (this.aiMode) this._updateAIInputs();
         if (this.canDrive) {
             if (this.keys.forward) this.speed += this.acceleration * deltaTime;
             else if (this.keys.backward) this.speed -= this.brakeStrength * deltaTime;
@@ -1314,6 +1504,7 @@ class CarControls {
             } else if (this.keys.left) this.steering = this.maxSteer * steerMult;
             else if (this.keys.right) this.steering = -this.maxSteer * steerMult;
             else this.steering = 0;
+            if (this.aiMode) this.steering = this._aiSteering * this.maxSteer * steerMult;
             this.updateSmoke(deltaTime);
             if (this.isDriftingState && this.isGrounded) {
                 this.smokeTimer += deltaTime;
@@ -1569,6 +1760,12 @@ if (btnStart) {
     });
 }
 
+// DEMO BUTTON
+const btnDemo = document.getElementById('demo-btn');
+if (btnDemo) {
+    btnDemo.addEventListener('click', () => startDemoMode());
+}
+
 // IN-GAME EXIT BUTTON
 const btnExitIngame = document.getElementById('menu-btn-ingame');
 if (btnExitIngame) {
@@ -1711,8 +1908,17 @@ function initGameSession() {
         );
         
         tryAttachAudio();
-        
-        if (typeof timeTrial !== 'undefined') timeTrial.fullReset(); 
+
+        if (typeof timeTrial !== 'undefined') timeTrial.fullReset();
+
+        if (demoModeActive) {
+            carController.aiMode = true;
+            carController.aiWaypoints = DEMO_WAYPOINTS;
+            carController.aiWaypointIndex = 0;
+            // Start BGM right away instead of waiting for warmup finish
+            if (bgmNormal.buffer && !bgmNormal.isPlaying) bgmNormal.play();
+        }
+
         window.focus();
 
     }, undefined, (err) => console.error(err));
@@ -1772,7 +1978,7 @@ document.getElementById('pause-exit-btn')?.addEventListener('click', () => {
 
 // --- GAMEPAD MENU NAVIGATOR ---
 const MenuNavigator = (() => {
-    const SECTIONS = ['mode-select', 'engine-select', 'car-select', 'start'];
+    const SECTIONS = ['mode-select', 'engine-select', 'car-select', 'start', 'demo'];
     let sectionIdx = 0;
     let btnIdx = 0;
     let pauseFocusIdx = 0;
@@ -1788,6 +1994,10 @@ const MenuNavigator = (() => {
     function getSectionBtns(sectionId) {
         if (sectionId === 'start') {
             const el = document.getElementById('start-race-btn');
+            return el ? [el] : [];
+        }
+        if (sectionId === 'demo') {
+            const el = document.getElementById('demo-btn');
             return el ? [el] : [];
         }
         const c = document.getElementById(sectionId);
@@ -1873,14 +2083,14 @@ const MenuNavigator = (() => {
         const dRight = justPressed(gp, 15) || axisMoved(gp, 0,  1);
         const dUp    = justPressed(gp, 12) || axisMoved(gp, 1, -1);
         const dDown  = justPressed(gp, 13) || axisMoved(gp, 1,  1);
-        const btnA   = justPressed(gp, 0);
-        const btnB   = justPressed(gp, 1);
-        const btnStart = justPressed(gp, 9);
+        const btnA      = justPressed(gp, 0);
+        const btnB      = justPressed(gp, 1);
+        const gpStart   = justPressed(gp, 9);
 
         const screen = currentScreen();
 
         if (screen === 'intro') {
-            if (btnA || btnStart) document.getElementById('intro-screen')?.click();
+            if (btnA || gpStart) document.getElementById('intro-screen')?.click();
 
         } else if (screen === 'menu') {
             if (dUp && sectionIdx > 0) {
@@ -1900,7 +2110,7 @@ const MenuNavigator = (() => {
                 btns[btnIdx]?.click();
                 applyMenuFocus();
             }
-            if (btnStart) document.getElementById('start-race-btn')?.click();
+            if (gpStart) document.getElementById('start-race-btn')?.click();
 
         } else if (screen === 'pause') {
             if (dUp   && pauseFocusIdx > 0) { pauseFocusIdx--; applyPauseFocus(); }
@@ -1909,13 +2119,13 @@ const MenuNavigator = (() => {
                 if (pauseFocusIdx === 0) document.getElementById('pause-restart-btn')?.click();
                 else                    document.getElementById('pause-exit-btn')?.click();
             }
-            if (btnB || btnStart) hidePause();
+            if (btnB || gpStart) hidePause();
 
         } else if (screen === 'results') {
-            if (btnA || btnStart) document.getElementById('return-menu-btn')?.click();
+            if (btnA || gpStart) document.getElementById('return-menu-btn')?.click();
 
         } else if (screen === 'ingame') {
-            if (btnStart) showPause();
+            if (gpStart) showPause();
         }
 
         savePrev(gp);
@@ -2093,8 +2303,56 @@ window.addEventListener('keydown', (event) => {
     }
 });
 
+// --- DEMO MODE ---
+function onExitDemo(e) {
+    if (!demoModeActive) return;
+    stopDemoMode();
+}
+
+function startDemoMode() {
+    demoModeActive = true;
+    const prevEngine = GAME_STATE.engine;
+    GAME_STATE.engine = '200cc';
+    GAME_STATE.mode = 'endless';
+
+    if (bgmMenu.isPlaying) bgmMenu.stop();
+    document.getElementById('main-menu').classList.add('hidden');
+    document.getElementById('ui-container').classList.remove('hidden');
+    document.getElementById('demo-overlay').classList.remove('hidden');
+
+    initGameSession();
+
+    // Restore engine selection so menu shows the right choice when user returns
+    GAME_STATE.engine = prevEngine;
+
+    // Any interaction exits demo
+    setTimeout(() => {
+        document.addEventListener('keydown', onExitDemo);
+        document.getElementById('demo-banner').addEventListener('click', onExitDemo);
+    }, 500); // Small delay so the click that launched demo doesn't immediately exit it
+}
+
+function stopDemoMode() {
+    demoModeActive = false;
+    document.getElementById('demo-overlay').classList.add('hidden');
+    document.removeEventListener('keydown', onExitDemo);
+    const banner = document.getElementById('demo-banner');
+    if (banner) banner.removeEventListener('click', onExitDemo);
+    if (carController) carController.aiMode = false;
+    returnToMainMenu();
+}
+
 // --- RETURN TO MENU LOGIC ---
 function returnToMainMenu() {
+    // Clean up demo mode if active
+    if (demoModeActive) {
+        demoModeActive = false;
+        document.getElementById('demo-overlay').classList.add('hidden');
+        document.removeEventListener('keydown', onExitDemo);
+        const banner = document.getElementById('demo-banner');
+        if (banner) banner.removeEventListener('click', onExitDemo);
+    }
+
     // 1. Hide Game UI & Results
     document.getElementById('ui-container').classList.add('hidden');
     document.getElementById('results-screen').classList.add('hidden');
