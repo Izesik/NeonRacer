@@ -1049,10 +1049,14 @@ class CarControls {
         this.accelerationSound = accelerationSoundRef || null;
         this.driftSound = driftSoundRef || null;
         this.keys = { forward: false, backward: false, left: false, right: false, space: false };
-        this.canDrive = true; 
+        this.canDrive = true;
+        this.analogSteering = 0;
+        this.gamepadIndex = null;
 
         window.addEventListener('keydown', (e) => this.onKeyDown(e));
         window.addEventListener('keyup', (e) => this.onKeyUp(e));
+        window.addEventListener('gamepadconnected', (e) => { this.gamepadIndex = e.gamepad.index; });
+        window.addEventListener('gamepaddisconnected', (e) => { if (this.gamepadIndex === e.gamepad.index) this.gamepadIndex = null; });
 
         // --- 6. VISUAL DEBUGGERS ---
         this.debugMode = false;
@@ -1172,6 +1176,34 @@ class CarControls {
         }
     }
 
+    pollGamepad() {
+        if (this.gamepadIndex === null) return;
+        const gp = navigator.getGamepads()[this.gamepadIndex];
+        if (!gp) return;
+
+        const DEADZONE = 0.15;
+        const isStandard = gp.mapping === 'standard';
+
+        // Only use left stick X for steering on standard-mapped controllers to avoid
+        // trigger axes being misread as steering on non-standard layouts.
+        const rawX = isStandard ? gp.axes[0] : 0;
+        this.analogSteering = Math.abs(rawX) > DEADZONE ? rawX : 0;
+
+        // RT = button 7, LT = button 6 (standard mapping only; no axis fallbacks)
+        const accel = gp.buttons[7]?.pressed || false;
+        const brake = gp.buttons[6]?.pressed || false;
+
+        if (this.canDrive) {
+            this.keys.forward = accel;
+            this.keys.backward = brake;
+            this.keys.space = gp.buttons[2]?.pressed || false;
+        }
+
+        // D-pad steering (digital fallback, separate from analog)
+        this.keys.left = gp.buttons[14]?.pressed || false;
+        this.keys.right = gp.buttons[15]?.pressed || false;
+    }
+
     spawnSmoke(pos) {
         const p = this.smokeParticles.find(p => p.life <= 0);
         if (p) {
@@ -1265,13 +1297,17 @@ class CarControls {
 
     // --- MAIN LOOP ---
     update(deltaTime) {
+        this.pollGamepad();
         if (this.canDrive) {
             if (this.keys.forward) this.speed += this.acceleration * deltaTime;
             else if (this.keys.backward) this.speed -= this.brakeStrength * deltaTime;
             else this.speed *= (1 - this.drag * deltaTime);
             this.isDriftingState = this.keys.space && Math.abs(this.speed) > 10;
-            if (this.keys.left) this.steering = this.maxSteer * (this.isDriftingState ? 2.0 : 1.0);
-            else if (this.keys.right) this.steering = -this.maxSteer * (this.isDriftingState ? 2.0 : 1.0);
+            const steerMult = this.isDriftingState ? 2.0 : 1.0;
+            if (this.analogSteering !== 0 && this.gamepadIndex !== null) {
+                this.steering = -this.analogSteering * this.maxSteer * steerMult;
+            } else if (this.keys.left) this.steering = this.maxSteer * steerMult;
+            else if (this.keys.right) this.steering = -this.maxSteer * steerMult;
             else this.steering = 0;
             this.updateSmoke(deltaTime);
             if (this.isDriftingState && this.isGrounded) {
