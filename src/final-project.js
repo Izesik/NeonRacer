@@ -128,13 +128,75 @@ let GAME_STATE = {
     isPlaying: false
 };
 
-// Rough directional waypoints — wall-avoidance raycasts do the fine steering
-const DEMO_WAYPOINTS = [
-    new THREE.Vector3(0, 10, -200),    // Straight ahead from start
-    new THREE.Vector3(370, 25, -130),  // Checkpoint 0
-    new THREE.Vector3(80, 47, 615),    // Checkpoint 1
-    new THREE.Vector3(0, 10, 80),      // Finish line
+// Racing line for demo mode: a closed lap through both checkpoints and the
+// finish line, laid down the middle of the road and then pulled towards the
+// apexes. Flat x,y,z triples, one point roughly every 10 units.
+const DEMO_LINE = [
+    4, 10, 79, 5, 10, 69, 5, 10, 59, 6, 10, 49, 6, 10, 40,
+    7, 10, 30, 7, 10, 20, 8, 10, 10, 9, 10, 1, 10, 10, -9,
+    11, 10, -19, 12, 10, -28, 12, 10, -37, 14, 10, -44, 19, 11, -50,
+    24, 11, -54, 28, 12, -58, 34, 12, -60, 41, 13, -62, 48, 13, -64,
+    57, 14, -66, 67, 14, -68, 78, 14, -70, 88, 14, -72, 98, 15, -74,
+    106, 15, -76, 114, 15, -78, 120, 16, -80, 125, 17, -83, 128, 17, -89,
+    131, 17, -94, 135, 17, -101, 138, 16, -109, 142, 15, -118, 146, 15, -128,
+    150, 14, -137, 154, 14, -147, 158, 13, -155, 161, 12, -163, 165, 11, -171,
+    169, 11, -179, 173, 10, -187, 177, 9, -196, 181, 8, -204, 185, 7, -213,
+    189, 7, -221, 194, 6, -229, 198, 5, -237, 202, 4, -244, 206, 4, -252,
+    210, 3, -260, 215, 2, -269, 220, 1, -277, 224, 0, -285, 229, -1, -294,
+    234, -2, -302, 239, -2, -310, 244, -2, -318, 248, -2, -326, 253, -2, -334,
+    258, -2, -342, 263, -2, -351, 268, -2, -358, 272, -2, -365, 277, -1, -371,
+    282, 0, -375, 287, 0, -379, 293, 1, -380, 300, 1, -381, 307, 2, -381,
+    313, 3, -379, 320, 3, -377, 325, 4, -373, 330, 4, -369, 335, 5, -363,
+    338, 6, -357, 340, 7, -351, 341, 8, -344, 340, 8, -337, 340, 9, -329,
+    339, 10, -321, 338, 10, -312, 337, 11, -302, 335, 13, -292, 333, 14, -281,
+    332, 15, -272, 332, 15, -265, 333, 16, -259, 333, 16, -253, 334, 16, -246,
+    336, 17, -237, 338, 17, -227, 340, 18, -217, 341, 18, -208, 343, 19, -199,
+    345, 19, -189, 347, 19, -180, 349, 20, -171, 350, 20, -162, 352, 20, -153,
+    354, 21, -143, 356, 21, -134, 358, 21, -125, 359, 21, -116, 361, 21, -107,
+    363, 21, -98, 364, 21, -89, 364, 21, -79, 365, 21, -70, 365, 21, -60,
+    366, 21, -50, 366, 21, -40, 367, 21, -30, 367, 21, -20, 367, 21, -11,
+    367, 21, -1, 367, 21, 9, 367, 21, 19, 367, 21, 29, 367, 21, 38,
+    367, 21, 48, 366, 21, 57, 366, 21, 66, 366, 21, 76, 365, 21, 85,
+    365, 21, 95, 365, 21, 105, 366, 21, 115, 367, 21, 124, 367, 21, 134,
+    368, 21, 143, 369, 21, 152, 369, 21, 162, 370, 21, 172, 370, 21, 182,
+    371, 21, 192, 371, 21, 202, 371, 22, 211, 372, 23, 221, 372, 24, 231,
+    372, 25, 241, 372, 26, 251, 372, 26, 261, 372, 27, 271, 372, 28, 281,
+    372, 29, 291, 372, 30, 301, 371, 31, 311, 371, 32, 321, 370, 33, 331,
+    370, 34, 341, 369, 35, 351, 368, 36, 361, 367, 36, 370, 366, 37, 380,
+    364, 38, 390, 362, 39, 400, 361, 40, 410, 359, 41, 419, 356, 42, 429,
+    354, 42, 439, 351, 43, 449, 349, 43, 458, 346, 44, 467, 343, 44, 474,
+    341, 45, 481, 338, 45, 487, 334, 46, 491, 329, 46, 495, 324, 46, 500,
+    318, 46, 505, 312, 47, 510, 304, 47, 516, 296, 47, 521, 288, 47, 526,
+    280, 47, 531, 272, 47, 536, 263, 47, 541, 255, 47, 545, 247, 47, 549,
+    238, 47, 553, 230, 47, 557, 221, 47, 560, 213, 47, 563, 204, 47, 566,
+    195, 47, 569, 186, 47, 572, 178, 47, 575, 169, 47, 577, 160, 47, 579,
+    151, 47, 581, 142, 47, 583, 133, 47, 585, 124, 47, 586, 115, 47, 587,
+    108, 47, 588, 101, 47, 589, 94, 47, 589, 86, 47, 589, 76, 47, 590,
+    65, 47, 589, 55, 46, 589, 46, 44, 589, 42, 43, 587, 39, 42, 585,
+    35, 41, 581, 32, 39, 572, 29, 38, 562, 26, 36, 553, 24, 35, 544,
+    22, 34, 538, 20, 33, 531, 18, 31, 521, 17, 29, 510, 16, 27, 498,
+    15, 26, 488, 14, 24, 478, 13, 23, 467, 12, 21, 458, 12, 20, 450,
+    11, 18, 440, 11, 16, 430, 11, 15, 419, 11, 13, 410, 10, 12, 401,
+    10, 9, 390, 9, 10, 379, 9, 10, 368, 8, 10, 358, 8, 10, 349,
+    8, 10, 340, 8, 10, 330, 9, 10, 321, 9, 10, 311, 9, 10, 302,
+    9, 10, 292, 9, 10, 283, 9, 10, 274, 10, 10, 264, 10, 10, 254,
+    9, 10, 244, 8, 10, 234, 8, 10, 225, 7, 10, 215, 7, 10, 206,
+    6, 10, 196, 6, 10, 187, 5, 10, 177, 5, 10, 167, 4, 10, 157,
+    4, 10, 147, 4, 10, 137, 4, 10, 127, 4, 10, 118, 4, 10, 108,
+    4, 10, 98, 4, 10, 88
 ];
+
+const DEMO_WAYPOINTS = [];
+for (let i = 0; i < DEMO_LINE.length; i += 3) {
+    DEMO_WAYPOINTS.push(new THREE.Vector3(DEMO_LINE[i], DEMO_LINE[i + 1], DEMO_LINE[i + 2]));
+}
+
+// Demo driver tuning.
+//   safety   - how much of the geometric cornering limit to use. Above 1 the car
+//              has to hang the tail out to make the corner, which is the point.
+//   lookBase - pure-pursuit aim distance at a standstill, plus lookGain per unit
+//              of speed. Short = twitchy, long = cuts corners.
+const AI = { safety: 1.15, lookBase: 14, lookGain: 0.34, drift: true };
 
 let demoModeActive = false;
 
@@ -1124,131 +1186,164 @@ class CarControls {
         if(this.driftSound) this.driftSound.setVolume(0);             
     }
 
-    _updateAIInputs() {
-        const worldPos = new THREE.Vector3();
-        const worldQuat = new THREE.Quaternion();
-        this.model.getWorldPosition(worldPos);
-        this.model.getWorldQuaternion(worldQuat);
+    _updateAIInputs(rawDelta = 1 / 60) {
+        const path = this.aiWaypoints;
+        if (!path || path.length < 4) return;
+        const n = path.length;
+        // Smoothed frame time: one long frame must not upset the speed profile.
+        this._aiDt = this._aiDt ? this._aiDt * 0.92 + rawDelta * 0.08 : rawDelta;
+        const deltaTime = THREE.MathUtils.clamp(this._aiDt, 1 / 240, 0.05);
 
-        const UP   = new THREE.Vector3(0, 1, 0);
-        const DOWN = new THREE.Vector3(0, -1, 0);
-        const carFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(worldQuat);
-        carFwd.y = 0;
-        if (carFwd.lengthSq() > 0) carFwd.normalize();
-
-        // Left-perpendicular in XZ plane (positive = left, negative = right)
-        const leftPerp = new THREE.Vector3(-carFwd.z, 0, carFwd.x);
-
-        const rayOrigin = worldPos.clone();
-        rayOrigin.y += 1.5;
-
-        // Speed-scaled lookahead: faster = see further ahead
-        const SCAN = THREE.MathUtils.clamp(22 + Math.abs(this.speed) * 0.4, 22, 55);
-
-        // --- WALL DETECTION (7 rays) ---
-        const wallDist = (deg) => {
-            const dir = carFwd.clone().applyAxisAngle(UP, THREE.MathUtils.degToRad(deg));
-            this.wallRaycaster.set(rayOrigin, dir);
-            this.wallRaycaster.far = SCAN;
-            const hits = this.wallRaycaster.intersectObjects(mapColliders);
-            const hit = hits.find(h => h.object.name !== 'SafetyNet');
-            return hit ? hit.distance : SCAN;
-        };
-
-        const fwdDist   = wallDist(0);
-        const leftNear  = wallDist(20);
-        const leftMid   = wallDist(50);
-        const leftWide  = wallDist(80);  // near-perpendicular: catches outer curve walls early
-        const rightNear = wallDist(-20);
-        const rightMid  = wallDist(-50);
-        const rightWide = wallDist(-80);
-
-        const leftSpace  = Math.min(leftNear, leftMid, leftWide);
-        const rightSpace = Math.min(rightNear, rightMid, rightWide);
-
-        // Steer toward the side with more open space
-        let wallAvoid = THREE.MathUtils.clamp((leftSpace - rightSpace) / SCAN * 4, -1, 1);
-
-        // Forward wall ahead: push toward the open side. Use 0.85*SCAN so turns are
-        // detected and acted on long before the wall is directly in front.
-        if (fwdDist < SCAN * 0.85) {
-            const urgency = THREE.MathUtils.clamp(1 - fwdDist / (SCAN * 0.85), 0, 1);
-            const openSide = leftSpace >= rightSpace ? 1.0 : -1.0;
-            wallAvoid = THREE.MathUtils.lerp(wallAvoid, openSide, urgency);
+        // ---- one-time: curvature radius + grade for every point on the line ----
+        if (!this._aiRadius || this._aiRadius.length !== n) {
+            this._aiRadius = new Float64Array(n);
+            this._aiGrade = new Float64Array(n);
+            this._aiSeg = new Float64Array(n);
+            // Circumradius over a wide stencil: sampling adjacent points only
+            // turns rounding noise into phantom hairpins.
+            const S = 3;
+            for (let i = 0; i < n; i++) {
+                const a = path[(i - S + n * 2) % n], b = path[i], c = path[(i + S) % n];
+                const ab = Math.hypot(b.x - a.x, b.z - a.z);
+                const bc = Math.hypot(c.x - b.x, c.z - b.z);
+                const ca = Math.hypot(a.x - c.x, a.z - c.z);
+                const area2 = Math.abs((b.x - a.x) * (c.z - a.z) - (c.x - a.x) * (b.z - a.z));
+                this._aiRadius[i] = area2 < 1e-6 ? 1e6 : (ab * bc * ca) / area2;
+                const nx = path[(i + 1) % n];
+                this._aiSeg[i] = Math.hypot(nx.x - b.x, nx.z - b.z);
+                this._aiGrade[i] = ca > 0.01 ? (c.y - a.y) / ca : 0;
+            }
+            // a corner is only as fast as its tightest part
+            const r = this._aiRadius.slice();
+            for (let i = 0; i < n; i++) {
+                for (let k = -S; k <= S; k++) {
+                    this._aiRadius[i] = Math.min(this._aiRadius[i], r[(i + k + n * 2) % n]);
+                }
+            }
+            this._aiVmax = new Float64Array(n);
         }
 
-        // --- CLIFF / ROAD-EDGE DETECTION ---
-        // Cast downward from a point ahead of the car. If no ground is found
-        // within ~10 units below, that side of the track is a cliff or edge.
-        const AHEAD = 14;
-        const hasGround = (fwd, side) => {
-            const p = worldPos.clone()
-                .addScaledVector(carFwd, fwd)
-                .addScaledVector(leftPerp, side);
-            p.y += 4;
-            this.groundRaycaster.set(p, DOWN);
-            this.groundRaycaster.far = 12;
-            const hits = this.groundRaycaster.intersectObjects(mapColliders);
-            return hits.some(h => h.object.name !== 'SafetyNet');
-        };
-
-        const leftGround   = hasGround(AHEAD,  3);
-        const rightGround  = hasGround(AHEAD, -3);
-        const centerGround = hasGround(AHEAD,  0);
-
-        let cliffSteer = 0;
-        let cliffDanger = false;
-        if (!leftGround || !rightGround || !centerGround) {
-            cliffDanger = true;
-            if (!rightGround && leftGround)       cliffSteer =  1.0;  // edge on right → turn left
-            else if (!leftGround && rightGround)  cliffSteer = -1.0;  // edge on left  → turn right
-            else if (!centerGround) {
-                // Road gone straight ahead — favor whichever side still has ground
-                if (leftGround)       cliffSteer = -1.0;
-                else if (rightGround) cliffSteer =  1.0;
-                else                  cliffSteer = (wallAvoid > 0 ? 1.0 : -1.0);
+        // ---- speed profile (recomputed if the frame rate shifts) ----
+        // The car turns a fixed angle per FRAME, so a slower frame rate means a
+        // wider turning circle; the car also slides a little wide of the ideal
+        // arc, and that lag grows with frame time. Both are folded in here.
+        const yawRate = this.maxSteer / deltaTime;                   // rad/s at full lock
+        const fpsScale = THREE.MathUtils.clamp(1 / (60 * deltaTime), 0.5, 1);
+        if (!this._aiProfileYaw || Math.abs(this._aiProfileYaw - yawRate) > yawRate * 0.08) {
+            this._aiProfileYaw = yawRate;
+            const v = this._aiVmax;
+            for (let i = 0; i < n; i++) {
+                let lim = yawRate * this._aiRadius[i] * AI.safety * fpsScale;
+                const g = this._aiGrade[i];
+                // the steep ramps on this track launch the car if taken flat out
+                if (g > 0.22) lim = Math.min(lim, THREE.MathUtils.lerp(75, 34, THREE.MathUtils.clamp((g - 0.22) / 0.45, 0, 1)));
+                if (g < -0.22) lim = Math.min(lim, 70);
+                v[i] = Math.min(lim, this.maxSpeed);
+            }
+            // backward pass: arrive at every corner already slow enough
+            const a = this.brakeStrength;
+            for (let pass = 0; pass < 3; pass++) {
+                for (let k = n; k > 0; k--) {
+                    const i = k % n, j = (i + 1) % n;
+                    const d = Math.max(this._aiSeg[i], 0.01);
+                    v[i] = Math.min(v[i], Math.sqrt(v[j] * v[j] + 2 * a * d));
+                }
             }
         }
 
-        // --- WAYPOINT GUIDANCE (soft directional nudge) ---
-        let waypointSteer = 0;
-        if (this.aiWaypoints && this.aiWaypoints.length > 0) {
-            const target = this.aiWaypoints[this.aiWaypointIndex];
-            const dx = worldPos.x - target.x;
-            const dz = worldPos.z - target.z;
-            if (Math.sqrt(dx * dx + dz * dz) < 50) {
-                this.aiWaypointIndex = (this.aiWaypointIndex + 1) % this.aiWaypoints.length;
+        // ---- where are we on the line ----
+        const pos = new THREE.Vector3(), quat = new THREE.Quaternion();
+        this.model.getWorldPosition(pos);
+        this.model.getWorldQuaternion(quat);
+        const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(quat);
+        fwd.y = 0;
+        if (fwd.lengthSq() < 1e-8) fwd.set(0, 0, -1);
+        fwd.normalize();
+        const speed = Math.abs(this.speed);
+
+        let idx = this.aiWaypointIndex | 0;
+        const d2 = (i) => (path[i].x - pos.x) ** 2 + (path[i].z - pos.z) ** 2;
+        // walk forward past points we have already gone by
+        for (let k = 0; k < 12; k++) {
+            const a = path[idx], b = path[(idx + 1) % n];
+            const sx = b.x - a.x, sz = b.z - a.z;
+            if ((pos.x - a.x) * sx + (pos.z - a.z) * sz > sx * sx + sz * sz) idx = (idx + 1) % n;
+            else break;
+        }
+        // lost the line (respawn, big shunt): re-acquire globally
+        if (d2(idx) > 90 * 90) {
+            let best = idx, bd = Infinity;
+            for (let i = 0; i < n; i++) { const d = d2(i); if (d < bd) { bd = d; best = i; } }
+            idx = best;
+        }
+        this.aiWaypointIndex = idx;
+
+        // ---- aim point ----
+        const look = THREE.MathUtils.clamp(AI.lookBase + speed * AI.lookGain, 12, 60);
+        let acc = Math.hypot(path[idx].x - pos.x, path[idx].z - pos.z);
+        let ti = idx;
+        while (acc < look) { const nx = (ti + 1) % n; acc += this._aiSeg[ti]; ti = nx; if (ti === idx) break; }
+        const aim = path[ti];
+
+        // ---- steering: pure pursuit + cross-track correction ----
+        const to = new THREE.Vector3(aim.x - pos.x, 0, aim.z - pos.z);
+        const dist = Math.max(to.length(), 1);
+        to.divideScalar(dist);
+        const cross = fwd.x * to.z - fwd.z * to.x;      // +ve => target is to the right
+        const dot = THREE.MathUtils.clamp(fwd.dot(to), -1, 1);
+        const alpha = Math.atan2(-cross, dot);          // +ve => steer left
+
+        // lateral error from the line, so we track it rather than just chase it
+        const segA = path[idx], segB = path[(idx + 1) % n];
+        const tx = segB.x - segA.x, tz = segB.z - segA.z;
+        const tl = Math.hypot(tx, tz) || 1;
+        const lateral = ((pos.x - segA.x) * tz - (pos.z - segA.z) * tx) / tl;   // +ve => right of line
+
+        // Pure pursuit gives the yaw rate that swings the car onto the aim point;
+        // the lateral term stops it settling parallel to the line but off it.
+        const yawWanted = (2 * Math.sin(alpha) * Math.max(speed, 12)) / Math.max(dist, 8)
+            + THREE.MathUtils.clamp(lateral * 0.035, -0.5, 0.5);
+
+        // A racer uses the handbrake when the corner asks for more rotation than
+        // the front tyres can give. Drifting doubles the steering authority, so
+        // the command is scaled to match and the car does not spin.
+        const gripYaw = this.maxSteer / deltaTime;
+        const wantDrift = AI.drift && speed > 50 && Math.abs(yawWanted) > gripYaw * 0.95;
+        const steerMult = wantDrift ? 2 : 1;
+        let steerCmd = yawWanted * deltaTime / (this.maxSteer * steerMult);
+
+        // ---- speed target ----
+        let target = this._aiVmax[idx];
+        for (let k = 1, j = idx; k <= 3; k++) { j = (j + 1) % n; target = Math.min(target, this._aiVmax[j]); }
+
+        // ---- safety net: a wall genuinely close ahead ----
+        const eye = pos.clone(); eye.y += 1.6;
+        const _n = new THREE.Vector3();
+        const wallAt = (deg, far) => {
+            const d = fwd.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), THREE.MathUtils.degToRad(deg));
+            this.wallRaycaster.set(eye, d);
+            this.wallRaycaster.far = far;
+            for (const h of this.wallRaycaster.intersectObjects(mapColliders)) {
+                if (h.object.name === 'SafetyNet' || !h.face) continue;
+                _n.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
+                if (Math.abs(_n.y) < 0.6) return h.distance;   // flat ramps are not walls
             }
-            const toTarget = new THREE.Vector3(target.x - worldPos.x, 0, target.z - worldPos.z);
-            if (toTarget.lengthSq() > 0) toTarget.normalize();
-            const cross = new THREE.Vector3().crossVectors(carFwd, toTarget);
-            waypointSteer = THREE.MathUtils.clamp(cross.y * 1.5, -1, 1);
-        }
+            return far;
+        };
+        const SAFE = Math.max(16, Math.min(45, speed * 0.45));
+        const wl = wallAt(24, SAFE), wr = wallAt(-24, SAFE), wf = wallAt(0, SAFE);
+        if (wl < SAFE) steerCmd -= (1 - wl / SAFE) * 1.4;
+        if (wr < SAFE) steerCmd += (1 - wr / SAFE) * 1.4;
+        if (wf < SAFE * 0.7) target = Math.min(target, Math.max(20, wf * 1.4));
 
-        // --- BLEND ---
-        if (cliffDanger) {
-            // Cliff overrides everything; also scrub speed so the turn is achievable
-            this._aiSteering = cliffSteer;
-            this.keys.forward = Math.abs(this.speed) < 45;
-        } else {
-            const minSpace = Math.min(fwdDist, leftSpace, rightSpace);
+        this._aiSteering = THREE.MathUtils.clamp(steerCmd, -1, 1);
 
-            // Walls visible → avoidance takes over with a guaranteed floor of 0.6
-            // so waypoints can never fully override wall steering
-            const rawWeight = THREE.MathUtils.clamp(1 - minSpace / SCAN, 0, 1);
-            const avoidWeight = minSpace < SCAN ? Math.max(rawWeight, 0.6) : 0;
-            this._aiSteering = THREE.MathUtils.lerp(waypointSteer * 0.25, wallAvoid, avoidWeight);
+        // ---- throttle / brake ----
+        this.keys.forward = speed < target;
+        this.keys.backward = speed > target * 1.06 + 4;
 
-            // Quadratic braking: slow down sharply as the nearest wall closes in
-            const nearWall = Math.min(fwdDist, leftNear, rightNear);
-            const brakeFactor = Math.pow(THREE.MathUtils.clamp(nearWall / (SCAN * 0.65), 0, 1), 2);
-            const targetSpeed = THREE.MathUtils.lerp(35, 85, brakeFactor);
-            this.keys.forward  = Math.abs(this.speed) < targetSpeed;
-            this.keys.backward = this.speed > targetSpeed + 12; // active brake if over limit
-        }
-
-        this.keys.space = false;
-        this.keys.left  = false;
+        this.keys.space = wantDrift;
+        this.keys.left = false;
         this.keys.right = false;
     }
 
@@ -1318,24 +1413,25 @@ class CarControls {
     }
 
     _aiRespawnToWaypoint() {
-        if (!this.aiWaypoints || this.aiWaypoints.length === 0) return;
+        const path = this.aiWaypoints;
+        if (!path || path.length === 0) return;
 
-        // Skip to the next waypoint so we escape the stuck area
-        this.aiWaypointIndex = (this.aiWaypointIndex + 1) % this.aiWaypoints.length;
-        const target   = this.aiWaypoints[this.aiWaypointIndex];
-        const nextIdx  = (this.aiWaypointIndex + 1) % this.aiWaypoints.length;
-        const nextWP   = this.aiWaypoints[nextIdx];
+        // Points are only ~10 units apart, so stepping to the next one would not
+        // clear whatever we are wedged against. Jump a car length or so down the
+        // racing line instead.
+        const AHEAD = Math.min(8, path.length - 1);
+        this.aiWaypointIndex = (this.aiWaypointIndex + AHEAD) % path.length;
+        const target = path[this.aiWaypointIndex];
+        const nextWP = path[(this.aiWaypointIndex + 1) % path.length];
 
-        // Teleport above the waypoint and let suspension handle the landing
+        // Drop in above the line and let the suspension settle it
         this.model.position.set(target.x, target.y + 5, target.z);
 
-        // Orient the physics body toward the next waypoint
         const facingDir = new THREE.Vector3(
             nextWP.x - target.x, 0, nextWP.z - target.z
         ).normalize();
         // atan2(-fx, -fz) gives the Y rotation needed so local -Z aligns with facingDir
-        const yAngle = Math.atan2(-facingDir.x, -facingDir.z);
-        this.model.rotation.set(0, yAngle, 0);
+        this.model.rotation.set(0, Math.atan2(-facingDir.x, -facingDir.z), 0);
         this.moveDirection.copy(facingDir);
 
         this.speed = 0;
@@ -1492,7 +1588,7 @@ class CarControls {
     // --- MAIN LOOP ---
     update(deltaTime) {
         this.pollGamepad();
-        if (this.aiMode) this._updateAIInputs();
+        if (this.aiMode) this._updateAIInputs(deltaTime);
         if (this.canDrive) {
             if (this.keys.forward) this.speed += this.acceleration * deltaTime;
             else if (this.keys.backward) this.speed -= this.brakeStrength * deltaTime;
