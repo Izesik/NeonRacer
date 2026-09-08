@@ -698,6 +698,19 @@ addSafetyNet();
 // per-frame body collision affordable.
 class TrackIndex {
     constructor(meshes, cell = 48) {
+        // The map is indexed in the same tick it is added to the scene, so the
+        // ancestor transforms have not been baked yet. Reading a stale
+        // matrixWorld puts every vertex in the wrong space - here that is the
+        // difference between a 440 unit track and a 41,000 unit one, which then
+        // explodes the grid below into millions of cells.
+        const roots = new Set();
+        for (const m of meshes) {
+            let r = m;
+            while (r.parent) r = r.parent;
+            roots.add(r);
+        }
+        roots.forEach(r => r.updateMatrixWorld(true));
+
         this.cell = cell;
         this.objs = [];
         const verts = [], norms = [], owner = [];
@@ -707,7 +720,6 @@ class TrackIndex {
 
         for (const m of meshes) {
             if (!m.geometry || !m.geometry.attributes.position) continue;
-            m.updateMatrixWorld(true);
             const oi = this.objs.length;
             const mat = Array.isArray(m.material) ? m.material[0] : m.material;
             this.objs.push({
@@ -748,8 +760,16 @@ class TrackIndex {
         }
         this.minX = minX;
         this.minZ = minZ;
-        this.nx = Math.max(1, Math.ceil((maxX - minX) / cell) + 1);
-        this.nz = Math.max(1, Math.ceil((maxZ - minZ) / cell) + 1);
+        // Whatever the world turns out to be, keep the grid to a size that can
+        // actually be built; a bad transform must never wedge the main thread.
+        const spanX = Math.max(maxX - minX, 1), spanZ = Math.max(maxZ - minZ, 1);
+        const MAX_CELLS = 262144;
+        if ((spanX / this.cell) * (spanZ / this.cell) > MAX_CELLS) {
+            this.cell = Math.sqrt((spanX * spanZ) / MAX_CELLS);
+            console.warn(`TrackIndex: world spans ${spanX.toFixed(0)}x${spanZ.toFixed(0)}, widening cells to ${this.cell.toFixed(1)}`);
+        }
+        this.nx = Math.max(1, Math.ceil(spanX / this.cell) + 1);
+        this.nz = Math.max(1, Math.ceil(spanZ / this.cell) + 1);
 
         const lists = new Array(this.nx * this.nz);
         for (let t = 0; t < this.count; t++) {
