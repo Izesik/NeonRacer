@@ -690,6 +690,200 @@ function addSafetyNet() {
 }
 addSafetyNet();
 
+// --- TRACK SPATIAL INDEX ---
+// three's Raycaster brute-forces every triangle of every mesh whose bounds the
+// ray touches. Two meshes in this map carry ~7.7k triangles each and span the
+// whole world, so one cast costs ~2ms - a third of a frame budget. Bucketing the
+// triangles into a flat XZ grid takes that under 0.01ms, which is what makes
+// per-frame body collision affordable.
+class TrackIndex {
+    constructor(meshes, cell = 48) {
+        // The map is indexed in the same tick it is added to the scene, so the
+        // ancestor transforms have not been baked yet. Reading a stale
+        // matrixWorld puts every vertex in the wrong space - here that is the
+        // difference between a 440 unit track and a 41,000 unit one, which then
+        // explodes the grid below into millions of cells.
+        const roots = new Set();
+        for (const m of meshes) {
+            let r = m;
+            while (r.parent) r = r.parent;
+            roots.add(r);
+        }
+        roots.forEach(r => r.updateMatrixWorld(true));
+
+        this.cell = cell;
+        this.objs = [];
+        const verts = [], norms = [], owner = [];
+        const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+        const la = new THREE.Vector3(), lb = new THREE.Vector3(), lc = new THREE.Vector3();
+        const n = new THREE.Vector3();
+
+        for (const m of meshes) {
+            if (!m.geometry || !m.geometry.attributes.position) continue;
+            const oi = this.objs.length;
+            const mat = Array.isArray(m.material) ? m.material[0] : m.material;
+            this.objs.push({
+                name: m.name,
+                matrixWorld: m.matrixWorld.clone(),
+                quaternion: m.quaternion.clone(),
+                doubleSided: mat ? mat.side === THREE.DoubleSide : false
+            });
+            const pos = m.geometry.attributes.position, idx = m.geometry.index;
+            const count = idx ? idx.count : pos.count;
+            for (let i = 0; i + 2 < count; i += 3) {
+                const i0 = idx ? idx.getX(i) : i, i1 = idx ? idx.getX(i + 1) : i + 1, i2 = idx ? idx.getX(i + 2) : i + 2;
+                la.fromBufferAttribute(pos, i0); lb.fromBufferAttribute(pos, i1); lc.fromBufferAttribute(pos, i2);
+                // three reports face.normal in object space, so store it that way
+                THREE.Triangle.getNormal(la, lb, lc, n);
+                norms.push(n.x, n.y, n.z);
+                a.copy(la).applyMatrix4(m.matrixWorld);
+                b.copy(lb).applyMatrix4(m.matrixWorld);
+                c.copy(lc).applyMatrix4(m.matrixWorld);
+                verts.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
+                owner.push(oi);
+            }
+        }
+        this.v = new Float32Array(verts);
+        this.n = new Float32Array(norms);
+        this.o = new Int32Array(owner);
+        this.count = owner.length;
+
+        let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
+        for (let t = 0; t < this.count; t++) {
+            for (let k = 0; k < 3; k++) {
+                const x = this.v[t * 9 + k * 3], z = this.v[t * 9 + k * 3 + 2];
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (z < minZ) minZ = z;
+                if (z > maxZ) maxZ = z;
+            }
+        }
+        this.minX = minX;
+        this.minZ = minZ;
+        // Whatever the world turns out to be, keep the grid to a size that can
+        // actually be built; a bad transform must never wedge the main thread.
+        const spanX = Math.max(maxX - minX, 1), spanZ = Math.max(maxZ - minZ, 1);
+        const MAX_CELLS = 262144;
+        if ((spanX / this.cell) * (spanZ / this.cell) > MAX_CELLS) {
+            this.cell = Math.sqrt((spanX * spanZ) / MAX_CELLS);
+            console.warn(`TrackIndex: world spans ${spanX.toFixed(0)}x${spanZ.toFixed(0)}, widening cells to ${this.cell.toFixed(1)}`);
+        }
+        this.nx = Math.max(1, Math.ceil(spanX / this.cell) + 1);
+        this.nz = Math.max(1, Math.ceil(spanZ / this.cell) + 1);
+
+        const lists = new Array(this.nx * this.nz);
+        for (let t = 0; t < this.count; t++) {
+            let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+            for (let k = 0; k < 3; k++) {
+                const x = this.v[t * 9 + k * 3], z = this.v[t * 9 + k * 3 + 2];
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
+                if (z < z0) z0 = z;
+                if (z > z1) z1 = z;
+            }
+            for (let cz = this._cz(z0); cz <= this._cz(z1); cz++) {
+                for (let cx = this._cx(x0); cx <= this._cx(x1); cx++) {
+                    const k = cz * this.nx + cx;
+                    (lists[k] || (lists[k] = [])).push(t);
+                }
+            }
+        }
+        this.buckets = lists.map(l => (l ? Int32Array.from(l) : null));
+        this.seen = new Int32Array(this.count);
+        this.tick = 0;
+    }
+
+    _cx(x) { return Math.min(this.nx - 1, Math.max(0, Math.floor((x - this.minX) / this.cell))); }
+    _cz(z) { return Math.min(this.nz - 1, Math.max(0, Math.floor((z - this.minZ) / this.cell))); }
+
+    // Same shape as Raycaster.intersectObjects: sorted, with object + face.normal.
+    raycast(origin, dir, far) {
+        this.tick++;
+        const out = [];
+        const ox = origin.x, oy = origin.y, oz = origin.z;
+        const dx = dir.x, dy = dir.y, dz = dir.z;
+
+        const sweepCell = (cx, cz) => {
+            const b = this.buckets[cz * this.nx + cx];
+            if (!b) return;
+            for (let i = 0; i < b.length; i++) {
+                const t = b[i];
+                if (this.seen[t] === this.tick) continue;
+                this.seen[t] = this.tick;
+                const d = this._hit(ox, oy, oz, dx, dy, dz, t * 9, far, this.objs[this.o[t]].doubleSided);
+                if (d !== null) {
+                    out.push({
+                        distance: d,
+                        point: new THREE.Vector3(ox + dx * d, oy + dy * d, oz + dz * d),
+                        object: this.objs[this.o[t]],
+                        face: { normal: new THREE.Vector3(this.n[t * 3], this.n[t * 3 + 1], this.n[t * 3 + 2]) }
+                    });
+                }
+            }
+        };
+
+        if (Math.hypot(dx, dz) < 1e-6) {
+            sweepCell(this._cx(ox), this._cz(oz));           // straight up or down
+        } else {
+            let cx = this._cx(ox), cz = this._cz(oz);
+            const stepX = dx > 0 ? 1 : -1, stepZ = dz > 0 ? 1 : -1;
+            const bx = this.minX + (cx + (dx > 0 ? 1 : 0)) * this.cell;
+            const bz = this.minZ + (cz + (dz > 0 ? 1 : 0)) * this.cell;
+            let tMaxX = Math.abs(dx) < 1e-9 ? Infinity : (bx - ox) / dx;
+            let tMaxZ = Math.abs(dz) < 1e-9 ? Infinity : (bz - oz) / dz;
+            const tDx = Math.abs(dx) < 1e-9 ? Infinity : Math.abs(this.cell / dx);
+            const tDz = Math.abs(dz) < 1e-9 ? Infinity : Math.abs(this.cell / dz);
+            let travelled = 0;
+            while (travelled <= far) {
+                sweepCell(cx, cz);
+                if (tMaxX < tMaxZ) {
+                    cx += stepX; travelled = tMaxX; tMaxX += tDx;
+                } else {
+                    cz += stepZ; travelled = tMaxZ; tMaxZ += tDz;
+                }
+                if (cx < 0 || cx >= this.nx || cz < 0 || cz >= this.nz) break;
+            }
+        }
+        out.sort((p, q) => p.distance - q.distance);
+        return out;
+    }
+
+    // Moller-Trumbore, honouring material side the way Mesh.raycast does
+    _hit(ox, oy, oz, dx, dy, dz, o, far, doubleSided) {
+        const v = this.v;
+        const ax = v[o], ay = v[o + 1], az = v[o + 2];
+        const e1x = v[o + 3] - ax, e1y = v[o + 4] - ay, e1z = v[o + 5] - az;
+        const e2x = v[o + 6] - ax, e2y = v[o + 7] - ay, e2z = v[o + 8] - az;
+        const px = dy * e2z - dz * e2y, py = dz * e2x - dx * e2z, pz = dx * e2y - dy * e2x;
+        const det = e1x * px + e1y * py + e1z * pz;
+        if (doubleSided ? Math.abs(det) < 1e-9 : det < 1e-9) return null;
+        const inv = 1 / det;
+        const tx = ox - ax, ty = oy - ay, tz = oz - az;
+        const u = (tx * px + ty * py + tz * pz) * inv;
+        if (u < 0 || u > 1) return null;
+        const qx = ty * e1z - tz * e1y, qy = tz * e1x - tx * e1z, qz = tx * e1y - ty * e1x;
+        const w = (dx * qx + dy * qy + dz * qz) * inv;
+        if (w < 0 || u + w > 1) return null;
+        const t = (e2x * qx + e2y * qy + e2z * qz) * inv;
+        return (t < 0 || t > far) ? null : t;
+    }
+}
+
+let trackIndex = null;
+
+// Cast against the track, through the index once it exists.
+function castTrack(raycaster, origin, dir, far) {
+    if (trackIndex) return trackIndex.raycast(origin, dir, far);
+    raycaster.set(origin, dir);
+    raycaster.far = far;
+    return raycaster.intersectObjects(mapColliders);
+}
+
+// A face blocks the car when it is too steep to stand on. This is the same test
+// the suspension uses to decide what counts as ground, so anything drivable -
+// including the steep ramps - is never treated as a wall.
+const WALL_MAX_NY = 0.5;
+
 
 
 
@@ -1094,7 +1288,12 @@ class CarControls {
         // --- 2. PHYSICS CONSTANTS ---
         this.rideHeight = 0.5; 
         this.tiltSpeed = 0.08; 
-        this.carLength = 4.0;
+        // Collision body: two circles along the car's axis, so the corners and
+        // flanks are covered rather than a single ray down the middle. Together
+        // they cover roughly a 4.2 x 2.6 footprint.
+        this.bodyRadius = 1.3;
+        this.bodyOffset = 0.8;
+        this.bodyHeights = [1.2, 2.6];   // above the model origin; steps over low kerbs
         this.wallBounce = 0.2; 
 
         // --- 3. STATE ---
@@ -1321,9 +1520,7 @@ class CarControls {
         const _n = new THREE.Vector3();
         const wallAt = (deg, far) => {
             const d = fwd.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), THREE.MathUtils.degToRad(deg));
-            this.wallRaycaster.set(eye, d);
-            this.wallRaycaster.far = far;
-            for (const h of this.wallRaycaster.intersectObjects(mapColliders)) {
+            for (const h of castTrack(this.wallRaycaster, eye, d, far)) {
                 if (h.object.name === 'SafetyNet' || !h.face) continue;
                 _n.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
                 if (Math.abs(_n.y) < 0.6) return h.distance;   // flat ramps are not walls
@@ -1535,54 +1732,176 @@ class CarControls {
         }
     }
 
-    checkWallCollisions() {
-        if (Math.abs(this.speed) < 1.0) return; 
-        const worldPos = new THREE.Vector3();
-        const worldQuat = new THREE.Quaternion();
-        this.model.getWorldPosition(worldPos);
-        this.model.getWorldQuaternion(worldQuat);
-        const forwardDir = new THREE.Vector3(0, 0, (this.speed > 0 ? -1 : 1));
-        forwardDir.applyQuaternion(worldQuat).normalize();
-        const rayOrigin = worldPos.clone();
-        rayOrigin.y += 2;
-        this.wallRaycaster.set(rayOrigin, forwardDir);
-        this.wallRaycaster.far = this.carLength + 2.0; 
-        const hits = this.wallRaycaster.intersectObjects(mapColliders);
-        if (hits.length > 0) {
-            const hit = hits[0];
-            if (hit.object.name === "SafetyNet") return;
-            if (!hit.face || !hit.face.normal) return;
-            const normal = hit.face.normal.clone();
-            normal.transformDirection(hit.object.matrixWorld).normalize();
-            if (isNaN(normal.x) || isNaN(normal.y)) return;
-            const specialTolerances = { "Object_40_1": 0.1, "Object_22": 0.8, "Object_34_1": 1.0, "Object_35_1": 1.0, "Object_50_1": 0.3, "Object_7_1" : 0.1, "Object_14_1" : 0.1};
-            let activeTolerance = .5; 
-            if (specialTolerances[hit.object.name] !== undefined) {
-                activeTolerance = specialTolerances[hit.object.name];
+    // Move-and-slide body collision against the barriers.
+    //
+    // The previous version cast a single ray forward from the car's centre.
+    // That missed anything the corners hit, missed walls entirely while
+    // drifting (the car travels sideways but the ray points along the bonnet),
+    // gave up if the first thing it hit happened to be a floor face, and -
+    // because the ray was a fixed 6 units long - let the car tunnel straight
+    // through the ~1 unit thick barriers whenever a frame moved it further
+    // than that.
+    //
+    // The car is modelled as two circles, front and rear. Each frame we work
+    // out where this frame's velocity would put it, sweep for anything in the
+    // way, then separate that destination from any wall it still overlaps and
+    // hand the result back as a velocity. Sweeping alone is not enough: a car
+    // running along a wall at a shallow angle points nearly parallel to it, so
+    // the swept ray only meets the wall far beyond the distance travelled.
+    checkWallCollisions(deltaTime) {
+        const pos = this.model.position;
+        const quat = new THREE.Quaternion();
+        this.model.getWorldQuaternion(quat);
+        const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(quat);
+        fwd.y = 0;
+        if (fwd.lengthSq() < 1e-8) return;
+        fwd.normalize();
+
+        const R = this.bodyRadius;
+        const OFF = this.bodyOffset;
+        const org = new THREE.Vector3();
+        const dir = new THREE.Vector3();
+        const nrm = new THREE.Vector3();
+        const front = new THREE.Vector3();
+        const rear = new THREE.Vector3();
+
+        // nearest blocking face along a ray, skipping anything drivable
+        const firstWall = (origin, direction, far) => {
+            const hits = castTrack(this.wallRaycaster, origin, direction, far);
+            for (let i = 0; i < hits.length; i++) {
+                const h = hits[i];
+                if (!h.face || !h.face.normal || h.object.name === 'SafetyNet') continue;
+                nrm.copy(h.face.normal).transformDirection(h.object.matrixWorld).normalize();
+                if (isNaN(nrm.x) || isNaN(nrm.y) || isNaN(nrm.z)) continue;
+                if (Math.abs(nrm.y) > WALL_MAX_NY) continue;
+                return { distance: h.distance, nx: nrm.x, nz: nrm.z };
             }
-            if (Math.abs(normal.y) > activeTolerance) return; 
-            if (hit.distance < this.carLength) {
-                const impactAngle = forwardDir.dot(normal);
-                if (impactAngle < -0.8) {
-                    let bounceSpeed = -this.speed * this.wallBounce;
-                    if (bounceSpeed < -20) bounceSpeed = -20;
-                    if (bounceSpeed > 20) bounceSpeed = 20;
-                    this.speed = bounceSpeed;
-                    const pushOut = forwardDir.clone().multiplyScalar(-1.5);
-                    this.model.position.add(pushOut);
-                } else {
-                    const slideDir = forwardDir.clone().sub(normal.clone().multiplyScalar(impactAngle));
-                    slideDir.normalize();
-                    const lookTarget = this.model.position.clone().add(slideDir);
-                    this.model.lookAt(lookTarget);
-                    this.model.rotateY(Math.PI);
-                    this.speed *= 0.4; 
-                    const pushOut = normal.clone().multiplyScalar(3.0);
-                    this.model.position.add(pushOut);
+            return null;
+        };
+
+        const vx = this.velocity.x, vz = this.velocity.z;
+        const planar = Math.hypot(vx, vz);
+        const travel = planar * deltaTime;
+
+        // Broad phase: on open road there is nothing within reach, and this is
+        // the overwhelmingly common case.
+        let near = false;
+        for (let k = 0; k < 4 && !near; k++) {
+            const a = k * Math.PI / 2;
+            dir.set(Math.sin(a), 0, Math.cos(a));
+            org.copy(pos);
+            org.y += this.bodyHeights[0];
+            if (firstWall(org, dir, travel + R + OFF + 1.0)) near = true;
+        }
+        if (!near) return;
+
+        // Push a position clear of anything its body overlaps.
+        const separate = (p, passes) => {
+            for (let iter = 0; iter < passes; iter++) {
+                let shifted = false;
+                front.copy(p).addScaledVector(fwd, OFF);
+                rear.copy(p).addScaledVector(fwd, -OFF);
+                for (let c = 0; c < 2; c++) {
+                    const centre = c === 0 ? front : rear;
+                    let best = null;
+                    for (let k = 0; k < 8; k++) {
+                        const a = k * Math.PI / 4;
+                        dir.set(Math.sin(a), 0, Math.cos(a));
+                        org.copy(centre);
+                        org.y += this.bodyHeights[0];
+                        const w = firstWall(org, dir, R);
+                        if (w && (!best || w.distance < best.distance)) {
+                            best = { distance: w.distance, nx: w.nx, nz: w.nz, dx: dir.x, dz: dir.z };
+                        }
+                    }
+                    if (!best) continue;
+                    let px = best.nx, pz = best.nz;
+                    if (px * best.dx + pz * best.dz > 0) { px = -px; pz = -pz; }   // face us
+                    const len = Math.hypot(px, pz);
+                    if (len < 1e-6) continue;
+                    const push = (R - best.distance) + 0.05;
+                    p.x += (px / len) * push;
+                    p.z += (pz / len) * push;
+                    shifted = true;
+                    front.copy(p).addScaledVector(fwd, OFF);
+                    rear.copy(p).addScaledVector(fwd, -OFF);
                 }
-                this.model.updateMatrixWorld(true);
+                if (!shifted) break;
+            }
+        };
+
+        // 1. free the car from anything it is already inside
+        separate(pos, 2);
+
+        // 2. walk the frame's movement in sub-steps no longer than the body, so
+        //    a fast car can never skip past a barrier between two samples, and
+        //    slide along whatever gets in the way
+        const dest = new THREE.Vector3(pos.x, pos.y, pos.z);
+        let mx = vx, mz = vz;
+        let hitSomething = false, headOnMax = 0;
+        const steps = travel > 1e-4 ? Math.min(8, Math.max(1, Math.ceil(travel / (R * 0.75)))) : 0;
+
+        for (let sIdx = 0; sIdx < steps; sIdx++) {
+            const mag = Math.hypot(mx, mz);
+            if (mag < 1e-5) break;
+            const ux = mx / mag, uz = mz / mag;
+            const stepTravel = (mag * deltaTime) / steps;
+            dir.set(ux, 0, uz);
+
+            front.copy(dest).addScaledVector(fwd, OFF);
+            rear.copy(dest).addScaledVector(fwd, -OFF);
+            let allowed = stepTravel, nx = 0, nz = 0, blocked = false;
+            for (let c = 0; c < 2; c++) {
+                const centre = c === 0 ? front : rear;
+                for (let hi = 0; hi < this.bodyHeights.length; hi++) {
+                    org.copy(centre);
+                    org.y += this.bodyHeights[hi];
+                    const w = firstWall(org, dir, stepTravel + R);
+                    if (!w) continue;
+                    const room = w.distance - R;
+                    if (room < allowed) { allowed = room; nx = w.nx; nz = w.nz; blocked = true; }
+                }
+            }
+
+            if (!blocked) {
+                dest.x += ux * stepTravel;
+                dest.z += uz * stepTravel;
+            } else {
+                const go = Math.max(allowed, 0);
+                dest.x += ux * go;
+                dest.z += uz * go;
+                if (nx * ux + nz * uz > 0) { nx = -nx; nz = -nz; }      // face us
+                const len = Math.hypot(nx, nz);
+                if (len > 1e-6) {
+                    nx /= len; nz /= len;
+                    const into = mx * nx + mz * nz;
+                    if (into < 0) { mx -= nx * into; mz -= nz * into; } // slide
+                    headOnMax = Math.max(headOnMax, Math.abs(into) / mag);
+                }
+                hitSomething = true;
+            }
+            separate(dest, 2);
+        }
+
+        // 3. hand the corrected movement back as velocity
+        const dx = dest.x - pos.x, dz = dest.z - pos.z;
+        const moved = Math.hypot(dx, dz);
+        const sign = this.speed >= 0 ? 1 : -1;
+
+        if (hitSomething && headOnMax > 0.9 && travel > 0.05) {
+            // square into a wall: shove back a little rather than sticking to it
+            this.speed = -sign * Math.min(20, Math.abs(this.speed) * this.wallBounce);
+        } else {
+            if (moved > 1e-6) {
+                const loss = hitSomething ? THREE.MathUtils.lerp(0.97, 0.5, headOnMax) : 1;
+                this.speed = sign * (moved / deltaTime) * loss;
+                this.moveDirection.set((dx / moved) * sign, 0, (dz / moved) * sign);
+            } else if (hitSomething) {
+                this.speed = 0;
             }
         }
+        this.velocity.x = this.moveDirection.x * this.speed;
+        this.velocity.z = this.moveDirection.z * this.speed;
     }
 
     // --- MAIN LOOP ---
@@ -1641,7 +1960,6 @@ class CarControls {
         wallRayOrigin.y += 2.0; 
         const suspRayOrigin = worldPos.clone();
         suspRayOrigin.y += 5.0; 
-        this.checkWallCollisions();
         const finalWorldQuat = new THREE.Quaternion();
         this.model.getWorldQuaternion(finalWorldQuat);
         const carFacingDir = new THREE.Vector3(0, 0, -1).applyQuaternion(finalWorldQuat);
@@ -1652,15 +1970,11 @@ class CarControls {
         this.velocity.z = this.moveDirection.z * this.speed;
         
         let rayOrigin = suspRayOrigin.clone();
-        this.groundRaycaster.set(rayOrigin, new THREE.Vector3(0, -1, 0));
-        this.groundRaycaster.far = 15.0; 
-        let hits = this.groundRaycaster.intersectObjects(mapColliders);
+        let hits = castTrack(this.groundRaycaster, rayOrigin, new THREE.Vector3(0, -1, 0), 15.0);
         let groundHit = null;
         if (hits.length > 0) groundHit = hits[0];
         if (!groundHit) {
-            this.upRaycaster.set(worldPos, new THREE.Vector3(0, 1, 0));
-            this.upRaycaster.far = 5.0; 
-            const upHits = this.upRaycaster.intersectObjects(mapColliders);
+            const upHits = castTrack(this.upRaycaster, worldPos, new THREE.Vector3(0, 1, 0), 5.0);
             if (upHits.length > 0) {
                 const roof = upHits[0];
                 if (!this.badObjects.includes(roof.object.name)) groundHit = roof; 
@@ -1715,6 +2029,8 @@ class CarControls {
                 this.safePosTimer = 0;
             }
         }
+        // Resolve against the barriers now that this frame's velocity is final.
+        this.checkWallCollisions(deltaTime);
         this.model.position.addScaledVector(this.velocity, deltaTime);
         if(this.model.position.y < -10) this.hardRespawn();
         if (this.isGrounded) {
@@ -1810,6 +2126,11 @@ export function levelOneBackground() {
                 }
             }
         });
+
+        // Everything in mapColliders is static, so index it once here.
+        const t0 = performance.now();
+        trackIndex = new TrackIndex(mapColliders);
+        console.log(`Track index: ${trackIndex.count} triangles in ${(performance.now() - t0).toFixed(0)}ms`);
 
     }, 
     (xhr) => { console.log("Map: " + ((xhr.loaded / xhr.total) * 100).toFixed(0) + "%"); },
